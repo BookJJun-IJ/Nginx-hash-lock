@@ -242,7 +242,8 @@ app.post('/nhl-auth/login', async (req, res) => {
         const sessionId = generateSessionId();
         sessions[sessionId] = {
             expires: Date.now() + SESSION_DURATION_MS,
-            passwordHash: PASSWORD_HASH
+            passwordHash: PASSWORD_HASH,
+            username: USERNAME,
         };
 
         console.log(`[Auth Service] Login successful for user: ${username}`);
@@ -293,7 +294,10 @@ app.get('/nhl-auth/check', (req, res) => {
             const oidcValid = !!session.oidcSub;
 
             if (passwordValid || authHashValid || oidcValid) {
-                console.log(`[Auth Service] Auth check passed via session (${sessionId.substring(0, 8)}...)`);
+                const authUser = session.oidcUser || session.oidcSub || session.username || '';
+                if (authUser) res.set('X-Auth-User', authUser);
+                if (session.oidcEmail) res.set('X-Auth-Email', session.oidcEmail);
+                console.log(`[Auth Service] Auth check passed via session (${sessionId.substring(0, 8)}...) user=${authUser}`);
                 return res.status(200).send('OK');
             } else {
                 console.log(`[Auth Service] Auth check failed: Credentials changed, invalidating session (${sessionId.substring(0, 8)}...)`);
@@ -363,7 +367,10 @@ app.get('/nhl-auth/check', (req, res) => {
     }
 
     // Session is valid
-    console.log(`[Auth Service] Auth check passed via session (${sessionId.substring(0, 8)}...)`);
+    const authUser = session.oidcUser || session.oidcSub || session.username || '';
+    if (authUser) res.set('X-Auth-User', authUser);
+    if (session.oidcEmail) res.set('X-Auth-Email', session.oidcEmail);
+    console.log(`[Auth Service] Auth check passed via session (${sessionId.substring(0, 8)}...) user=${authUser}`);
     res.status(200).send('OK');
 });
 
@@ -503,8 +510,10 @@ app.get('/nhl-auth/oidc/callback', async (req, res) => {
         sessions[sessionId] = {
             expires: Date.now() + SESSION_DURATION_MS,
             oidcSub: claims.sub,
+            oidcUser: claims.preferred_username || claims.email || claims.sub,
+            oidcEmail: claims.email || '',
         };
-        console.log(`[Auth Service] OIDC session created for sub=${claims.sub} (${sessionId.substring(0, 8)}...)`);
+        console.log(`[Auth Service] OIDC session created for sub=${claims.sub} user=${sessions[sessionId].oidcUser} (${sessionId.substring(0, 8)}...)`);
 
         res.cookie('nginxhashlock_session', sessionId, {
             httpOnly: true,

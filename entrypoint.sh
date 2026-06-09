@@ -138,6 +138,7 @@ case "$AUTH_MODE" in
         AUTH_CHECK_BLOCK="            # Hash-only authentication with session
             auth_request /internal-auth-check;
             auth_request_set \$auth_cookie \$upstream_http_set_cookie;
+            auth_request_set \$auth_user \$upstream_http_x_auth_user;
             add_header Set-Cookie \$auth_cookie;
             error_page 401 = @auth_failed_403;"
 
@@ -154,6 +155,7 @@ case "$AUTH_MODE" in
         AUTH_CHECK_BLOCK="            # Credentials-only authentication
             auth_request /internal-auth-check;
             auth_request_set \$auth_cookie \$upstream_http_set_cookie;
+            auth_request_set \$auth_user \$upstream_http_x_auth_user;
             add_header Set-Cookie \$auth_cookie;
             error_page 401 = @auth_failed_login;"
 
@@ -170,6 +172,7 @@ case "$AUTH_MODE" in
         AUTH_CHECK_BLOCK="            # Auth service checks both hash and session
             auth_request /internal-auth-check;
             auth_request_set \$auth_cookie \$upstream_http_set_cookie;
+            auth_request_set \$auth_user \$upstream_http_x_auth_user;
             add_header Set-Cookie \$auth_cookie;
             error_page 401 = @auth_failed_login;"
 
@@ -189,6 +192,7 @@ case "$AUTH_MODE" in
             # endpoint, which kicks off the authorization_code flow against Authelia.
             auth_request /internal-auth-check;
             auth_request_set \$auth_cookie \$upstream_http_set_cookie;
+            auth_request_set \$auth_user \$upstream_http_x_auth_user;
             add_header Set-Cookie \$auth_cookie;
             error_page 401 = @auth_failed_oidc;"
 
