@@ -25,6 +25,10 @@ const AUTO_LOGIN_URL = process.env.AUTO_LOGIN_URL || '';
 const AUTO_LOGIN_BODY = process.env.AUTO_LOGIN_BODY || '';
 const AUTO_LOGIN_METHOD = (process.env.AUTO_LOGIN_METHOD || 'POST').toUpperCase();
 const AUTO_LOGIN_CONTENT_TYPE = process.env.AUTO_LOGIN_CONTENT_TYPE || 'application/json';
+// If the backend login API returns a token in the response body (e.g. JWT)
+// instead of Set-Cookie headers, set this to the cookie name to use.
+// The response body will be set as the cookie value.
+const AUTO_LOGIN_COOKIE_NAME = process.env.AUTO_LOGIN_COOKIE_NAME || '';
 const BACKEND_HOST = process.env.BACKEND_HOST || 'localhost';
 const BACKEND_PORT = process.env.BACKEND_PORT || '80';
 // Override the username sent in X-Auth-User (and thus Remote-User) header.
@@ -60,6 +64,9 @@ function generateSessionId() {
  * captures Set-Cookie headers, and adds them to the outgoing response
  * so the browser receives both the NHL session cookie and the app's cookies.
  *
+ * For apps that return a token in the response body (e.g. FileBrowser returns JWT),
+ * set AUTO_LOGIN_COOKIE_NAME to have the body set as a browser cookie.
+ *
  * @param {import('express').Response} res - Express response to attach cookies to
  * @returns {Promise<boolean>} true if auto-login succeeded (or was skipped)
  */
@@ -91,15 +98,27 @@ async function performAutoLogin(res) {
             for (const cookieHeader of setCookieHeaders) {
                 res.append('Set-Cookie', cookieHeader);
             }
-        } else {
-            console.log('[Auth Service] Auto-login: no Set-Cookie headers from backend');
         }
 
+        // Read response body — needed for token-based auth and error logging
+        const body = await response.text().catch(() => '');
+
         if (response.status >= 200 && response.status < 400) {
+            // If AUTO_LOGIN_COOKIE_NAME is set, use the response body as a cookie value.
+            // This handles apps like FileBrowser that return a JWT token in the body
+            // instead of setting cookies.
+            if (AUTO_LOGIN_COOKIE_NAME && body) {
+                const tokenValue = body.replace(/^"|"$/g, '').trim(); // Strip surrounding quotes
+                console.log(`[Auth Service] Auto-login: setting cookie '${AUTO_LOGIN_COOKIE_NAME}' from response body`);
+                res.cookie(AUTO_LOGIN_COOKIE_NAME, tokenValue, {
+                    path: '/',
+                    httpOnly: false, // App JS may need to read it
+                    sameSite: 'lax',
+                });
+            }
             console.log('[Auth Service] Auto-login: success');
             return true;
         } else {
-            const body = await response.text().catch(() => '');
             console.warn(`[Auth Service] Auto-login: backend returned ${response.status} — ${body.substring(0, 200)}`);
             return false;
         }
