@@ -19,6 +19,15 @@ const SESSION_DURATION_MS = SESSION_DURATION_HOURS * 60 * 60 * 1000;
 const OIDC_REGISTRAR_URL = (process.env.OIDC_REGISTRAR_URL || '').replace(/\/+$/, '');
 const OIDC_ENABLED = OIDC_REGISTRAR_URL.length > 0;
 
+// Auto-login configuration: after SSO auth, call the backend app's login API
+// to obtain the app's own session cookie, so the user doesn't face a second login.
+const AUTO_LOGIN_URL = process.env.AUTO_LOGIN_URL || '';
+const AUTO_LOGIN_BODY = process.env.AUTO_LOGIN_BODY || '';
+const AUTO_LOGIN_METHOD = (process.env.AUTO_LOGIN_METHOD || 'POST').toUpperCase();
+const AUTO_LOGIN_CONTENT_TYPE = process.env.AUTO_LOGIN_CONTENT_TYPE || 'application/json';
+const BACKEND_HOST = process.env.BACKEND_HOST || 'localhost';
+const BACKEND_PORT = process.env.BACKEND_PORT || '80';
+
 // Generate password hash for session validation
 // When password changes (container restart), password-based sessions become invalid
 const PASSWORD_HASH = crypto.createHash('sha256').update(PASSWORD + USERNAME).digest('hex');
@@ -39,6 +48,61 @@ const OIDC_FLOW_TTL_MS = 10 * 60 * 1000;
 // Generate secure random session ID
 function generateSessionId() {
     return crypto.randomBytes(32).toString('hex');
+}
+
+/**
+ * Perform auto-login against the backend app.
+ * Calls the backend's login endpoint with pre-configured credentials,
+ * captures Set-Cookie headers, and adds them to the outgoing response
+ * so the browser receives both the NHL session cookie and the app's cookies.
+ *
+ * @param {import('express').Response} res - Express response to attach cookies to
+ * @returns {Promise<boolean>} true if auto-login succeeded (or was skipped)
+ */
+async function performAutoLogin(res) {
+    if (!AUTO_LOGIN_URL) return true; // No auto-login configured, skip
+
+    const backendUrl = `http://${BACKEND_HOST}:${BACKEND_PORT}${AUTO_LOGIN_URL}`;
+    console.log(`[Auth Service] Auto-login: calling ${AUTO_LOGIN_METHOD} ${backendUrl}`);
+
+    try {
+        const fetchOptions = {
+            method: AUTO_LOGIN_METHOD,
+            headers: {},
+            redirect: 'manual', // Don't follow redirects — we want the Set-Cookie from the login response
+        };
+
+        if (AUTO_LOGIN_BODY && AUTO_LOGIN_METHOD !== 'GET') {
+            fetchOptions.headers['Content-Type'] = AUTO_LOGIN_CONTENT_TYPE;
+            fetchOptions.body = AUTO_LOGIN_BODY;
+        }
+
+        const response = await fetch(backendUrl, fetchOptions);
+        console.log(`[Auth Service] Auto-login: backend responded ${response.status}`);
+
+        // Capture Set-Cookie headers from the backend and forward to browser
+        const setCookieHeaders = response.headers.getSetCookie ? response.headers.getSetCookie() : [];
+        if (setCookieHeaders.length > 0) {
+            console.log(`[Auth Service] Auto-login: forwarding ${setCookieHeaders.length} cookie(s) from backend`);
+            for (const cookieHeader of setCookieHeaders) {
+                res.append('Set-Cookie', cookieHeader);
+            }
+        } else {
+            console.log('[Auth Service] Auto-login: no Set-Cookie headers from backend');
+        }
+
+        if (response.status >= 200 && response.status < 400) {
+            console.log('[Auth Service] Auto-login: success');
+            return true;
+        } else {
+            const body = await response.text().catch(() => '');
+            console.warn(`[Auth Service] Auto-login: backend returned ${response.status} — ${body.substring(0, 200)}`);
+            return false;
+        }
+    } catch (err) {
+        console.error(`[Auth Service] Auto-login failed:`, err.message);
+        return false; // Don't block the SSO flow if auto-login fails
+    }
 }
 
 // Cleanup expired sessions every hour
@@ -257,6 +321,9 @@ app.post('/nhl-auth/login', async (req, res) => {
             sameSite: 'lax'
         });
 
+        // Auto-login: obtain the backend app's session cookie
+        await performAutoLogin(res);
+
         res.redirect(redirect || '/');
     } else {
         // Apply 2-second delay for failed attempts (anti-brute force)
@@ -375,7 +442,7 @@ app.get('/nhl-auth/check', (req, res) => {
 });
 
 // Establish session endpoint (for hash authentication to set cookies properly)
-app.get('/nhl-auth/establish-session', (req, res) => {
+app.get('/nhl-auth/establish-session', async (req, res) => {
     // Check if hash parameter is valid
     if (process.env.AUTH_HASH) {
         const hash = req.query.hash;
@@ -424,6 +491,9 @@ app.get('/nhl-auth/establish-session', (req, res) => {
                 maxAge: SESSION_DURATION_MS,
                 sameSite: 'lax'
             });
+
+            // Auto-login: obtain the backend app's session cookie
+            await performAutoLogin(res);
 
             // Redirect back if requested
             if (req.query.return_to) {
@@ -521,6 +591,11 @@ app.get('/nhl-auth/oidc/callback', async (req, res) => {
             maxAge: SESSION_DURATION_MS,
             sameSite: 'lax',
         });
+
+        // Auto-login: obtain the backend app's session cookie so the user
+        // doesn't face a second login after SSO completes.
+        await performAutoLogin(res);
+
         res.redirect(flow.originalUri || '/');
     } catch (err) {
         console.error('[Auth Service] OIDC callback failed:', err);
@@ -546,5 +621,6 @@ app.listen(PORT, () => {
     console.log(`[Auth Service] Password configured: ${PASSWORD ? 'Yes' : 'No'}`);
     console.log(`[Auth Service] OIDC enabled: ${OIDC_ENABLED ? `Yes (registrar=${OIDC_REGISTRAR_URL})` : 'No'}`);
     console.log(`[Auth Service] Session duration: ${SESSION_DURATION_HOURS} hours`);
+    console.log(`[Auth Service] Auto-login: ${AUTO_LOGIN_URL ? `Yes (${AUTO_LOGIN_METHOD} ${AUTO_LOGIN_URL})` : 'No'}`);
     console.log('=====================================');
 });
