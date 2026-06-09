@@ -27,6 +27,10 @@ const AUTO_LOGIN_METHOD = (process.env.AUTO_LOGIN_METHOD || 'POST').toUpperCase(
 const AUTO_LOGIN_CONTENT_TYPE = process.env.AUTO_LOGIN_CONTENT_TYPE || 'application/json';
 const BACKEND_HOST = process.env.BACKEND_HOST || 'localhost';
 const BACKEND_PORT = process.env.BACKEND_PORT || '80';
+// Override the username sent in X-Auth-User (and thus Remote-User) header.
+// Useful for proxy-auth apps where the backend user doesn't match the OIDC username.
+// e.g. FileBrowser only has "admin" user, so set PROXY_AUTH_USERNAME=admin.
+const PROXY_AUTH_USERNAME = process.env.PROXY_AUTH_USERNAME || '';
 
 // Generate password hash for session validation
 // When password changes (container restart), password-based sessions become invalid
@@ -361,7 +365,7 @@ app.get('/nhl-auth/check', (req, res) => {
             const oidcValid = !!session.oidcSub;
 
             if (passwordValid || authHashValid || oidcValid) {
-                const authUser = session.oidcUser || session.oidcSub || session.username || '';
+                const authUser = PROXY_AUTH_USERNAME || session.oidcUser || session.oidcSub || session.username || '';
                 if (authUser) res.set('X-Auth-User', authUser);
                 if (session.oidcEmail) res.set('X-Auth-Email', session.oidcEmail);
                 console.log(`[Auth Service] Auth check passed via session (${sessionId.substring(0, 8)}...) user=${authUser}`);
@@ -434,7 +438,7 @@ app.get('/nhl-auth/check', (req, res) => {
     }
 
     // Session is valid
-    const authUser = session.oidcUser || session.oidcSub || session.username || '';
+    const authUser = PROXY_AUTH_USERNAME || session.oidcUser || session.oidcSub || session.username || '';
     if (authUser) res.set('X-Auth-User', authUser);
     if (session.oidcEmail) res.set('X-Auth-Email', session.oidcEmail);
     console.log(`[Auth Service] Auth check passed via session (${sessionId.substring(0, 8)}...) user=${authUser}`);
@@ -622,5 +626,6 @@ app.listen(PORT, () => {
     console.log(`[Auth Service] OIDC enabled: ${OIDC_ENABLED ? `Yes (registrar=${OIDC_REGISTRAR_URL})` : 'No'}`);
     console.log(`[Auth Service] Session duration: ${SESSION_DURATION_HOURS} hours`);
     console.log(`[Auth Service] Auto-login: ${AUTO_LOGIN_URL ? `Yes (${AUTO_LOGIN_METHOD} ${AUTO_LOGIN_URL})` : 'No'}`);
+    console.log(`[Auth Service] Proxy auth username override: ${PROXY_AUTH_USERNAME || '(none — use OIDC identity)'}`);
     console.log('=====================================');
 });
