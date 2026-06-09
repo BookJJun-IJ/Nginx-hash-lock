@@ -29,6 +29,9 @@ const AUTO_LOGIN_CONTENT_TYPE = process.env.AUTO_LOGIN_CONTENT_TYPE || 'applicat
 // instead of Set-Cookie headers, set this to the cookie name to use.
 // The response body will be set as the cookie value.
 const AUTO_LOGIN_COOKIE_NAME = process.env.AUTO_LOGIN_COOKIE_NAME || '';
+// If the backend app reads auth tokens from localStorage (e.g. FileBrowser uses localStorage key "jwt"),
+// set this to the localStorage key name. The redirect after login will inject JavaScript to set it.
+const AUTO_LOGIN_LOCALSTORAGE_KEY = process.env.AUTO_LOGIN_LOCALSTORAGE_KEY || '';
 const BACKEND_HOST = process.env.BACKEND_HOST || 'localhost';
 const BACKEND_PORT = process.env.BACKEND_PORT || '80';
 // Override the username sent in X-Auth-User (and thus Remote-User) header.
@@ -68,10 +71,10 @@ function generateSessionId() {
  * set AUTO_LOGIN_COOKIE_NAME to have the body set as a browser cookie.
  *
  * @param {import('express').Response} res - Express response to attach cookies to
- * @returns {Promise<boolean>} true if auto-login succeeded (or was skipped)
+ * @returns {Promise<{success: boolean, token?: string}>} result with optional token value
  */
 async function performAutoLogin(res) {
-    if (!AUTO_LOGIN_URL) return true; // No auto-login configured, skip
+    if (!AUTO_LOGIN_URL) return { success: true }; // No auto-login configured, skip
 
     const backendUrl = `http://${BACKEND_HOST}:${BACKEND_PORT}${AUTO_LOGIN_URL}`;
     console.log(`[Auth Service] Auto-login: calling ${AUTO_LOGIN_METHOD} ${backendUrl}`);
@@ -104,6 +107,7 @@ async function performAutoLogin(res) {
         const body = await response.text().catch(() => '');
 
         if (response.status >= 200 && response.status < 400) {
+            let autoLoginToken = '';
             // If AUTO_LOGIN_COOKIE_NAME is set, use the response body as a cookie value.
             // This handles apps like FileBrowser that return a JWT token in the body
             // instead of setting cookies.
@@ -115,17 +119,30 @@ async function performAutoLogin(res) {
                     httpOnly: false, // App JS may need to read it
                     sameSite: 'lax',
                 });
+                autoLoginToken = tokenValue;
             }
             console.log('[Auth Service] Auto-login: success');
-            return true;
+            return { success: true, token: autoLoginToken };
         } else {
             console.warn(`[Auth Service] Auto-login: backend returned ${response.status} — ${body.substring(0, 200)}`);
-            return false;
+            return { success: false };
         }
     } catch (err) {
         console.error(`[Auth Service] Auto-login failed:`, err.message);
-        return false; // Don't block the SSO flow if auto-login fails
+        return { success: false }; // Don't block the SSO flow if auto-login fails
     }
+}
+
+/**
+ * Redirect via an HTML page that sets localStorage before navigating.
+ * Used when AUTO_LOGIN_LOCALSTORAGE_KEY is configured — some SPA frontends
+ * (e.g. FileBrowser) read auth tokens from localStorage, not cookies.
+ */
+function redirectWithLocalStorage(res, targetUrl, key, value) {
+    res.type('html').send(`<!DOCTYPE html><html><head><script>
+localStorage.setItem(${JSON.stringify(key)}, ${JSON.stringify(value)});
+window.location.replace(${JSON.stringify(targetUrl)});
+</script></head><body></body></html>`);
 }
 
 // Cleanup expired sessions every hour
@@ -345,9 +362,14 @@ app.post('/nhl-auth/login', async (req, res) => {
         });
 
         // Auto-login: obtain the backend app's session cookie
-        await performAutoLogin(res);
+        const autoLoginResult = await performAutoLogin(res);
 
-        res.redirect(redirect || '/');
+        const target = redirect || '/';
+        if (AUTO_LOGIN_LOCALSTORAGE_KEY && autoLoginResult.token) {
+            redirectWithLocalStorage(res, target, AUTO_LOGIN_LOCALSTORAGE_KEY, autoLoginResult.token);
+        } else {
+            res.redirect(target);
+        }
     } else {
         // Apply 2-second delay for failed attempts (anti-brute force)
         const elapsed = Date.now() - startTime;
@@ -516,10 +538,13 @@ app.get('/nhl-auth/establish-session', async (req, res) => {
             });
 
             // Auto-login: obtain the backend app's session cookie
-            await performAutoLogin(res);
+            const autoLoginResult = await performAutoLogin(res);
 
             // Redirect back if requested
             if (req.query.return_to) {
+                if (AUTO_LOGIN_LOCALSTORAGE_KEY && autoLoginResult.token) {
+                    return redirectWithLocalStorage(res, returnTo, AUTO_LOGIN_LOCALSTORAGE_KEY, autoLoginResult.token);
+                }
                 return res.redirect(returnTo);
             }
 
@@ -617,9 +642,14 @@ app.get('/nhl-auth/oidc/callback', async (req, res) => {
 
         // Auto-login: obtain the backend app's session cookie so the user
         // doesn't face a second login after SSO completes.
-        await performAutoLogin(res);
+        const autoLoginResult = await performAutoLogin(res);
 
-        res.redirect(flow.originalUri || '/');
+        const target = flow.originalUri || '/';
+        if (AUTO_LOGIN_LOCALSTORAGE_KEY && autoLoginResult.token) {
+            redirectWithLocalStorage(res, target, AUTO_LOGIN_LOCALSTORAGE_KEY, autoLoginResult.token);
+        } else {
+            res.redirect(target);
+        }
     } catch (err) {
         console.error('[Auth Service] OIDC callback failed:', err);
         res.status(500).send('OIDC callback failed: ' + err.message);
@@ -645,6 +675,7 @@ app.listen(PORT, () => {
     console.log(`[Auth Service] OIDC enabled: ${OIDC_ENABLED ? `Yes (registrar=${OIDC_REGISTRAR_URL})` : 'No'}`);
     console.log(`[Auth Service] Session duration: ${SESSION_DURATION_HOURS} hours`);
     console.log(`[Auth Service] Auto-login: ${AUTO_LOGIN_URL ? `Yes (${AUTO_LOGIN_METHOD} ${AUTO_LOGIN_URL})` : 'No'}`);
+    if (AUTO_LOGIN_LOCALSTORAGE_KEY) console.log(`[Auth Service] Auto-login localStorage key: ${AUTO_LOGIN_LOCALSTORAGE_KEY}`);
     console.log(`[Auth Service] Proxy auth username override: ${PROXY_AUTH_USERNAME || '(none — use OIDC identity)'}`);
     console.log('=====================================');
 });
