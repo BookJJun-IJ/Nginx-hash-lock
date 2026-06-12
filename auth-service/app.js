@@ -39,6 +39,23 @@ const BACKEND_PORT = process.env.BACKEND_PORT || '80';
 // e.g. FileBrowser only has "admin" user, so set PROXY_AUTH_USERNAME=admin.
 const PROXY_AUTH_USERNAME = process.env.PROXY_AUTH_USERNAME || '';
 
+// Auto-setup configuration: on startup, call the backend app's setup/signup API
+// to create the initial user account before auto-login can work.
+// This eliminates the need for pre-install-cmd user creation in many cases.
+const AUTO_SETUP_URL = process.env.AUTO_SETUP_URL || '';
+const AUTO_SETUP_BODY = process.env.AUTO_SETUP_BODY || '';
+const AUTO_SETUP_METHOD = (process.env.AUTO_SETUP_METHOD || 'POST').toUpperCase();
+const AUTO_SETUP_CONTENT_TYPE = process.env.AUTO_SETUP_CONTENT_TYPE || 'application/json';
+// For apps that require authentication before setup (e.g., change default password),
+// set AUTO_SETUP_AUTH_URL to login first with default credentials.
+// The auth token (from response body or cookies) will be used for the setup call.
+const AUTO_SETUP_AUTH_URL = process.env.AUTO_SETUP_AUTH_URL || '';
+const AUTO_SETUP_AUTH_BODY = process.env.AUTO_SETUP_AUTH_BODY || '';
+// Header name used to pass the auth token to the setup request (default: Cookie).
+// If set to a custom value (e.g., "X-Auth"), the token from the auth response body
+// will be sent as that header's value. If empty, cookies from the auth response are forwarded.
+const AUTO_SETUP_AUTH_HEADER = process.env.AUTO_SETUP_AUTH_HEADER || '';
+
 // Generate password hash for session validation
 // When password changes (container restart), password-based sessions become invalid
 const PASSWORD_HASH = crypto.createHash('sha256').update(PASSWORD + USERNAME).digest('hex');
@@ -125,12 +142,127 @@ async function performAutoLogin(res) {
             return { success: true, token: autoLoginToken };
         } else {
             console.warn(`[Auth Service] Auto-login: backend returned ${response.status} — ${body.substring(0, 200)}`);
+
+            // If auto-login failed and auto-setup is configured but hasn't run yet,
+            // try running auto-setup and retry the login once.
+            if (AUTO_SETUP_URL && !autoSetupCompleted) {
+                console.log('[Auth Service] Auto-login failed, attempting auto-setup before retry...');
+                await performAutoSetup();
+                if (autoSetupCompleted) {
+                    console.log('[Auth Service] Auto-setup completed, retrying auto-login...');
+                    return performAutoLogin(res);
+                }
+            }
+
             return { success: false };
         }
     } catch (err) {
         console.error(`[Auth Service] Auto-login failed:`, err.message);
         return { success: false }; // Don't block the SSO flow if auto-login fails
     }
+}
+
+/**
+ * Perform auto-setup against the backend app.
+ * Runs at startup to create the initial user account in the backend app.
+ * Supports two modes:
+ *   1. Simple: POST to AUTO_SETUP_URL with AUTO_SETUP_BODY (no auth needed)
+ *   2. Authenticated: Login via AUTO_SETUP_AUTH_URL first, then use the token
+ *      to call AUTO_SETUP_URL (for apps that require auth to create/modify users)
+ *
+ * Retries with backoff until the backend is ready. Treats 2xx and 409 as success.
+ * This function is fire-and-forget — it never blocks the main server.
+ */
+let autoSetupCompleted = false;
+
+async function performAutoSetup() {
+    if (!AUTO_SETUP_URL) return;
+
+    const backendBase = `http://${BACKEND_HOST}:${BACKEND_PORT}`;
+    const maxRetries = 30;
+    const retryDelay = 3000;
+
+    console.log(`[Auth Service] Auto-setup: will call ${AUTO_SETUP_METHOD} ${backendBase}${AUTO_SETUP_URL}`);
+    if (AUTO_SETUP_AUTH_URL) {
+        console.log(`[Auth Service] Auto-setup: will authenticate first via POST ${backendBase}${AUTO_SETUP_AUTH_URL}`);
+    }
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            let authCookies = [];
+            let authToken = '';
+
+            // Step 1: Authenticate if needed
+            if (AUTO_SETUP_AUTH_URL) {
+                const authResponse = await fetch(`${backendBase}${AUTO_SETUP_AUTH_URL}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': AUTO_LOGIN_CONTENT_TYPE },
+                    body: AUTO_SETUP_AUTH_BODY,
+                    redirect: 'manual',
+                });
+
+                if (authResponse.status < 200 || authResponse.status >= 400) {
+                    const errBody = await authResponse.text().catch(() => '');
+                    console.warn(`[Auth Service] Auto-setup auth: attempt ${attempt}/${maxRetries} failed (${authResponse.status}) — ${errBody.substring(0, 200)}`);
+                    if (attempt < maxRetries) {
+                        await new Promise(r => setTimeout(r, retryDelay));
+                    }
+                    continue;
+                }
+
+                // Capture auth cookies
+                authCookies = authResponse.headers.getSetCookie ? authResponse.headers.getSetCookie() : [];
+                // Capture auth token from response body
+                authToken = (await authResponse.text().catch(() => '')).replace(/^"|"$/g, '').trim();
+                console.log(`[Auth Service] Auto-setup auth: success (${authResponse.status}), cookies=${authCookies.length}, token=${authToken ? 'yes' : 'no'}`);
+            }
+
+            // Step 2: Call setup endpoint
+            const setupHeaders = { 'Content-Type': AUTO_SETUP_CONTENT_TYPE };
+
+            // Forward auth: either custom header with token, or Cookie header
+            if (AUTO_SETUP_AUTH_HEADER && authToken) {
+                setupHeaders[AUTO_SETUP_AUTH_HEADER] = authToken;
+            } else if (authCookies.length > 0) {
+                // Extract cookie name=value pairs from Set-Cookie headers
+                const cookiePairs = authCookies.map(c => c.split(';')[0]).join('; ');
+                setupHeaders['Cookie'] = cookiePairs;
+            }
+
+            const fetchOptions = {
+                method: AUTO_SETUP_METHOD,
+                headers: setupHeaders,
+                redirect: 'manual',
+            };
+
+            if (AUTO_SETUP_BODY && AUTO_SETUP_METHOD !== 'GET') {
+                fetchOptions.body = AUTO_SETUP_BODY;
+            }
+
+            const response = await fetch(`${backendBase}${AUTO_SETUP_URL}`, fetchOptions);
+            const body = await response.text().catch(() => '');
+
+            if (response.status >= 200 && response.status < 300) {
+                console.log(`[Auth Service] Auto-setup: success (${response.status})`);
+                autoSetupCompleted = true;
+                return;
+            } else if (response.status === 409) {
+                console.log(`[Auth Service] Auto-setup: already exists (409), skipping`);
+                autoSetupCompleted = true;
+                return;
+            } else {
+                console.warn(`[Auth Service] Auto-setup: attempt ${attempt}/${maxRetries} failed (${response.status}) — ${body.substring(0, 200)}`);
+            }
+        } catch (err) {
+            console.warn(`[Auth Service] Auto-setup: attempt ${attempt}/${maxRetries} error — ${err.message}`);
+        }
+
+        if (attempt < maxRetries) {
+            await new Promise(r => setTimeout(r, retryDelay));
+        }
+    }
+
+    console.error(`[Auth Service] Auto-setup: failed after ${maxRetries} attempts — auto-login may not work`);
 }
 
 /**
@@ -658,11 +790,15 @@ app.get('/nhl-auth/oidc/callback', async (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => {
-    res.status(200).json({
+    const result = {
         status: 'ok',
         activeSessions: Object.keys(sessions).length,
-        sessionDurationHours: SESSION_DURATION_HOURS
-    });
+        sessionDurationHours: SESSION_DURATION_HOURS,
+    };
+    if (AUTO_SETUP_URL) {
+        result.autoSetup = autoSetupCompleted ? 'completed' : 'pending';
+    }
+    res.status(200).json(result);
 });
 
 // Start server
@@ -676,6 +812,16 @@ app.listen(PORT, () => {
     console.log(`[Auth Service] Session duration: ${SESSION_DURATION_HOURS} hours`);
     console.log(`[Auth Service] Auto-login: ${AUTO_LOGIN_URL ? `Yes (${AUTO_LOGIN_METHOD} ${AUTO_LOGIN_URL})` : 'No'}`);
     if (AUTO_LOGIN_LOCALSTORAGE_KEY) console.log(`[Auth Service] Auto-login localStorage key: ${AUTO_LOGIN_LOCALSTORAGE_KEY}`);
+    console.log(`[Auth Service] Auto-setup: ${AUTO_SETUP_URL ? `Yes (${AUTO_SETUP_METHOD} ${AUTO_SETUP_URL})` : 'No'}`);
+    if (AUTO_SETUP_AUTH_URL) console.log(`[Auth Service] Auto-setup auth: Yes (POST ${AUTO_SETUP_AUTH_URL})`);
     console.log(`[Auth Service] Proxy auth username override: ${PROXY_AUTH_USERNAME || '(none — use OIDC identity)'}`);
     console.log('=====================================');
+
+    // Run auto-setup in background after server starts.
+    // This waits for the backend app to be ready and creates the initial user account.
+    if (AUTO_SETUP_URL) {
+        performAutoSetup().catch(err => {
+            console.error('[Auth Service] Auto-setup background task failed:', err.message);
+        });
+    }
 });
